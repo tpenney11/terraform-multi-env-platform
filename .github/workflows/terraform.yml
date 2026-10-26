@@ -1,0 +1,149 @@
+# Plan on pull requests (read-only role), apply on main (scoped role, approval).
+#
+# Repository variable:      PLAN_ROLE_ARN   (bootstrap output plan_role_arn)
+# Per GitHub Environment:   APPLY_ROLE_ARN  (bootstrap output apply_role_arns[env]),
+#                           a deployment-branch rule allowing only main (the apply
+#                           role trusts the Environment, not the branch), and
+#                           required reviewers on staging and prod-*.
+name: terraform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false # never cancel a run that may hold a state lock
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_VERSION: "1.9.8"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: fmt
+        run: terraform fmt -check -recursive
+      - name: validate root and modules
+        run: make validate-all
+      - uses: terraform-linters/setup-tflint@v4
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids API rate limits when tflint --init downloads plugins
+        run: |
+          tflint --init
+          tflint --recursive
+
+  plan:
+    if: github.event_name == 'pull_request'
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # request the OIDC token
+      contents: read
+      pull-requests: write # post the plan
+    strategy:
+      fail-fast: false # show every environment's plan, even if one errors
+      matrix:
+        env: [dev, staging, prod-us-east-1, prod-us-west-2, prod-eu-central-1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false # the wrapper would mask exit codes
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PLAN_ROLE_ARN }}
+          aws-region: us-east-1 # region of the state backend; workloads use env/*.tfvars
+          role-session-name: plan-${{ matrix.env }}
+      - name: terraform plan
+        id: plan
+        shell: bash
+        env:
+          ENV_NAME: ${{ matrix.env }}
+        run: |
+          # `make plan` exits non-zero on any error and records terraform's
+          # -detailed-exitcode (0 = no changes, 2 = changes) in .plans/<env>.exitcode.
+          # make itself cannot pass 1 vs 2 through (it exits 2 for every failure),
+          # so the code is read from the file, never from make's status. Output is
+          # captured to a file without a pipe, so nothing masks the status.
+          set +e
+          make plan ENV="${ENV_NAME}" > plan.log 2>&1
+          rc=$?
+          set -e
+          cat plan.log
+          if [ "${rc}" -eq 0 ]; then code="$(cat ".plans/${ENV_NAME}.exitcode")"; else code=1; fi
+          echo "exitcode=${code}" >> "$GITHUB_OUTPUT"
+          case "${code}" in
+            0|2) exit 0 ;;
+            *)   echo "::error::terraform plan failed for ${ENV_NAME}"; exit 1 ;;
+          esac
+      - name: post plan
+        if: always() && steps.plan.outputs.exitcode != ''
+        uses: actions/github-script@v7
+        env:
+          ENV_NAME: ${{ matrix.env }}
+          EXIT_CODE: ${{ steps.plan.outputs.exitcode }}
+        with:
+          script: |
+            const fs = require('fs');
+            const status = {0: 'no changes', 2: 'changes pending'}[process.env.EXIT_CODE] || 'ERROR';
+            let log = fs.readFileSync('plan.log', 'utf8');
+            if (log.length > 60000) log = '... truncated ...\n' + log.slice(-60000);
+            const body = `### terraform plan: \`${process.env.ENV_NAME}\` (${status})\n<details><summary>output</summary>\n\n\`\`\`\n${log}\n\`\`\`\n</details>`;
+            await core.summary.addRaw(body).write();
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: context.issue.number, body,
+            });
+
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      max-parallel: 1 # roll out in order; fail-fast stops later environments
+      fail-fast: true
+      matrix:
+        env: [dev, staging, prod-us-east-1, prod-us-west-2, prod-eu-central-1]
+    # The GitHub Environment holds the approval rule and the APPLY_ROLE_ARN
+    # variable, and its name is the OIDC subject the apply role trusts.
+    environment: ${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.APPLY_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: apply-${{ matrix.env }}
+      - name: plan with apply role
+        id: plan
+        shell: bash
+        env:
+          ENV_NAME: ${{ matrix.env }}
+        run: |
+          # Fails the job on any plan error; see the plan job for why the code
+          # comes from .plans/<env>.exitcode rather than make's exit status.
+          make plan ENV="${ENV_NAME}" ROLE=terraform-apply
+          echo "exitcode=$(cat ".plans/${ENV_NAME}.exitcode")" >> "$GITHUB_OUTPUT"
+      - name: apply saved plan
+        if: steps.plan.outputs.exitcode == '2'
+        env:
+          ENV_NAME: ${{ matrix.env }}
+        run: make apply ENV="${ENV_NAME}"
